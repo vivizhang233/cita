@@ -18,9 +18,21 @@
 #![allow(deprecated,unused_assignments, unused_must_use)]
 
 use base_hanlder::{BaseHandler, RpcResult};
+
+use base_hanlder::Handler;
+use futures::{BoxFuture, Future};
+use futures::future::FutureResult;
+use futures::sync::oneshot;
+
+use hyper;
 use hyper::Post;
+use hyper::header::ContentLength;
 use hyper::server::{Handler, Request, Response};
+use hyper::server::{Http, Service, NewService, Request, Response};
+use hyper::server::Server;
 use hyper::uri::RequestUri::AbsolutePath;
+
+
 use jsonrpc_types::error::Error;
 use jsonrpc_types::method;
 use jsonrpc_types::response::{self as cita_response, RpcSuccess, RpcFailure};
@@ -41,19 +53,86 @@ use std::thread;
 use std::time::Duration;
 use util::H256;
 
-impl BaseHandler for RpcHandler {}
+impl NewService for Handler {
+    type Request = Request;
+    type Response = Response;
+    type Error = hyper::Error;
+    type Instance = HttpHandler;
+    fn new_service(&self) -> io::Result<Handler> {
+        Ok(self.clone())
+    }
+}
 
-pub struct RpcHandler {
-    pub tx: Arc<Mutex<Sender<(String, Vec<u8>)>>>,
-    pub responses: Arc<RwLock<HashMap<Vec<u8>, request::Response>>>,
-    pub tx_responses: Arc<RwLock<HashMap<H256, blockchain::TxResponse>>>,
-    pub sleep_duration: usize,
-    pub timeout_count: usize,
-    pub method_handler: method::MethodHandler,
+impl Service for Handler {
+	type Request = Request;
+	type Response = Response;
+	type Error = hyper::Error;
+	type Future = BoxFuture<Response, hyper::Error>;
+	
+	fn call(&self, req: Request) -> Self::Future {
+		let (tx, rx) = oneshot::channel();
+		let this = self.clone();
+		// self.send_pool(||{
+		//	this.deal_http_req();
+		//
+		// });
+		rx.map_err(|_| {
+			//出错处理。以及错误转换。这个肯定是系统错误了。转化为hyper的系统错误。
+			
+			
+		})
+		  .boxed()
+		
+	}
 }
 
 
-impl RpcHandler {
+impl Handler{
+    pub fn deal_req(&mut self, tx: TransferSender, data: String) -> Result<(), Error> {
+
+        let req_id = Id::Null;
+        let jsonrpc_version = None;
+        match HttpHandler::into_json(data) {
+            Err(err) => Err(err),
+            Ok(rpc) => {
+                let req_id = rpc.id.clone();
+                let jsonrpc_version = rpc.jsonrpc.clone();
+                let topic = WsHandler::select_topic(&rpc.method);
+                let req_info = ReqInfo {
+                    jsonrpc: jsonrpc_version.clone(),
+                    id: req_id.clone(),
+                };
+
+                _self.method_handler.from_req(rpc).map(|req_type| {
+                    match req_type {
+                        method::RpcReqType::TX(tx_req) => {
+                            //TODO key一定要唯一了。
+                            let hash = tx_req.crypt_hash();
+                            let data: communication::Message = tx_req.into();
+                            let _ = _self.tx.send((topic, data.write_to_bytes().unwrap()));
+
+                            _self.tx_responses.lock().insert(hash, (req_info, tx));
+                        }
+
+                        method::RpcReqType::REQ(_req) => {
+                            //TODO 请求id唯一可以用数字标识了。整数，usize 类型了，只要保证它是唯一的。这样的话包括容器也可以唯一了。
+                            let key = _req.request_id.clone();
+                            let data: communication::Message = _req.into();
+                            let _ = _self.tx.send((topic, data.write_to_bytes().unwrap()));
+                            _self.responses.lock().insert(key, (req_info, tx));
+                        }
+                    }
+                    ()
+                })
+            }
+        }
+
+    }
+}
+
+
+impl Handler {
+	
     pub fn pase_url(&self, mut req: Request) -> Result<String, Error> {
         let uri = req.uri.clone();
         let method = req.method.clone();
@@ -76,12 +155,12 @@ impl RpcHandler {
 
 
     pub fn deal_req(&self, post_data: String) -> Result<RpcSuccess, RpcFailure> {
-        match RpcHandler::into_json(post_data) {
+        match HttpHandler::into_json(post_data) {
             Err(err) => Err(RpcFailure::from(err)),
             Ok(rpc) => {
                 let req_id = rpc.id.clone();
                 let jsonrpc_version = rpc.jsonrpc.clone();
-                let topic = RpcHandler::select_topic(&rpc.method);
+                let topic = HttpHandler::select_topic(&rpc.method);
                 match self.method_handler.from_req(rpc)? {
                     method::RpcReqType::TX(tx) => {
                         let hash = tx.crypt_hash();
@@ -111,56 +190,6 @@ impl RpcHandler {
             }
         }
     }
-
-
-    pub fn send_mq<K, V>(&self, topic: String, req: communication::Message, responses: Arc<RwLock<HashMap<K, V>>>, key: K) -> RpcResult<V>
-    where
-        K: Eq + Hash + Debug,
-    {
-        {
-            let tx = self.tx.clone();
-            tx.lock().send((topic, req.write_to_bytes().unwrap())).unwrap();
-        }
-        trace!("wait response {:?}", key);
-        let mut timeout_count = 0;
-        loop {
-            timeout_count = timeout_count + 1;
-            if timeout_count > self.timeout_count {
-                //TODO
-                return Err(Error::server_error(-32099, "system time out,please resend"));
-            }
-            thread::sleep(Duration::new(0, (self.sleep_duration * 1000000) as u32));
-            if responses.read().contains_key(&key) {
-                let mut responses = responses.write();
-                if let Some(res) = responses.remove(&key) {
-                    return Ok(res);
-                } else {
-                    //TODO
-                    return Err(Error::invalid_params("duplicated transaction,please wait a while "));
-                }
-            }
-        }
-    }
-}
-
-
-
-impl Handler for RpcHandler {
-    fn handle(&self, req: Request, res: Response) {
-        //TODO 不允许在这里做业务处理。
-        let data = match self.pase_url(req) {
-            Err(err) => serde_json::to_string(&RpcFailure::from(err)),
-            Ok(body) => {
-                trace!("Request data {:?}", body);
-                match self.deal_req(body) {
-                    Ok(ret) => serde_json::to_string(&ret),
-                    Err(err) => serde_json::to_string(&err),
-                }
-            }
-        };
-
-        //TODO
-        trace!("respone data {:?}", data);
-        res.send(data.unwrap().as_ref());
-    }
+	
+	
 }

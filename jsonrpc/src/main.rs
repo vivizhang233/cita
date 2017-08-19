@@ -58,8 +58,18 @@ use clap::App;
 use config::ProfileConfig;
 use cpuprofiler::PROFILER;
 use dotenv::dotenv;
-use http_handler::RpcHandler;
+use http_handler::HttpHandler;
+
 use hyper::server::Server;
+use futures::{BoxFuture, Future};
+use futures::sync::oneshot;
+use futures::future::FutureResult;
+use hyper::header::ContentLength;
+use hyper::server::{Http, Service, NewService,Request, Response};
+
+
+
+
 use jsonrpc_types::method;
 use log::LogLevelFilter;
 use parking_lot::{RwLock, Mutex};
@@ -142,7 +152,7 @@ fn main() {
             let url = http_config.listen_ip.clone() + ":" + &http_config.listen_port.clone().to_string();
             let arc_tx = Arc::new(Mutex::new(sender_mq_http));
             info!("Http Listening on {}", url);
-            let _ = Server::http(url).unwrap().handle_threads(RpcHandler {
+            let _ = Server::http(url).unwrap().handle_threads(HttpHandler {
                                                                   responses: http_responses,
                                                                   tx: arc_tx,
                                                                   tx_responses: http_tx_responses,

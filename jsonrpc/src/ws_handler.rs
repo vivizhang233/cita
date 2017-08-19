@@ -70,6 +70,7 @@ impl Factory for WsFactory {
             tx_responses: self.tx_responses.clone(),
             responses: self.responses.clone(),
             tx: self.tx.clone(),
+			
             thread_pool: self.thread_pool.clone(),
             method_handler: method::MethodHandler,
         }
@@ -85,9 +86,10 @@ impl Handler for WsHandler {
 
         let _self = self.clone();
         self.thread_pool.lock().execute(move || {
+			
             let req_id = Id::Null;
             let jsonrpc_version = None;
-
+			//TODO
             let err = match WsHandler::into_json(msg.into_text().unwrap()) {
                 Err(err) => Err(err),
                 Ok(rpc) => {
@@ -120,6 +122,8 @@ impl Handler for WsHandler {
                     err
                 }
             };
+			
+			
             //TODO 错误返回
             if let Err(err) = err {
                 let _ = _self.sender
@@ -141,8 +145,10 @@ impl Handler for WsHandler {
 pub struct WsHandler {
     tx_responses: Arc<Mutex<HashMap<H256, (ReqInfo, ws::Sender)>>>,
     responses: Arc<Mutex<HashMap<Vec<u8>, (ReqInfo, ws::Sender)>>>,
+	
     thread_pool: Arc<Mutex<ThreadPool>>,
     method_handler: method::MethodHandler,
+	
     sender: ws::Sender,
     tx: Sender<(String, Vec<u8>)>,
 }
