@@ -15,27 +15,40 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#![allow(deprecated,unused_assignments, unused_must_use)]
+//#![allow(deprecated,unused_assignments, unused_must_use)]
+
+use futures::sync::oneshot::Sender as HttpSender;
+//use hyper::header::ContentLength;
+use hyper::server::Response;
+use jsonrpc_types::{method, Version, Id, RpcRequest};
 use jsonrpc_types::error::Error;
-use jsonrpc_types::request::RpcRequest;
-use libproto::communication;
-use num_cpus;
+use jsonrpc_types::method::MethodHandler;
+use jsonrpc_types::response::{ResponseBody, RpcSuccess, RpcFailure};
+use libproto::{communication, submodules, topics, parse_msg, cmd_id, display_cmd, MsgClass};
 use parking_lot::Mutex;
 use protobuf::Message;
 use serde_json;
-use serde_json;
 use std::collections::HashMap;
+use std::convert::Into;
 use std::result;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use threadpool::ThreadPool;
-use util::hash::H256;
-use ws;
-use ws::{Factory, CloseCode, Handler};
-
+use ws::Sender as WsSender;
 
 
 pub type RpcResult<T> = result::Result<T, Error>;
+
+pub trait FnBox {
+    fn call_box(self: Box<Self>);
+}
+
+impl<F: FnOnce()> FnBox for F {
+    fn call_box(self: Box<F>) {
+        (*self)()
+    }
+}
+
+type Thunk<'a> = Box<FnBox + Send + 'a>;
 
 pub trait BaseHandler {
     fn select_topic(method: &String) -> String {
@@ -61,83 +74,76 @@ pub trait BaseHandler {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TransferType {
-    ALL,
-    HTTP,
-    WEBSOCKET,
+
+pub enum Senders {
+    HTTP(HttpSender<Response>),
+    WEBSOCKET(WsSender),
 }
 
-
-impl Default for TransferType {
-    fn default() -> TransferType {
-        TransferType::ALL
-    }
-}
-
-
-use futures::sync::oneshot::Sender as HttpSender;
-use ws::Sender as WsSender;
-
-
-
-//Inner是同一个，唯一的一个，而线程池应该也是同一个，但是线程池不能和它作为一个
-#[derive(Clone)]
-struct Inner {
-    tx_responses: Mutex<HashMap<H256, (ReqInfo, ws::Sender)>>,
-    responses: Mutex<HashMap<Vec<u8>, (ReqInfo, ws::Sender)>>,
-}
-
-//这是一个客户的请求产生一个。
-//这里可以看到，其实mq,http,ws都是指向了同一结构体。因此我们可以利用通道，指向同一个结构体，
-//线程池就不需要枷锁了。整个jsonrpc就一个线程池。
-//
-//多个线程访问同一个线程池。
-
-use std::collections::HashMap;
-
-
-#[derive(Clone)]
-struct FactoryHandler {
-    inner: Arc<Inner>, //固定
-	tx_mq: Option<Sender<(String, Vec<u8>)>>, //必须有的。固定。
-}
-
-
-
-#[derive(Clone)]
-struct Handler {
-    inner: Arc<Inner>, //固定
-    tx_mq: Option<Sender<(String, Vec<u8>)>>, //必须有的。固定。
-
-    //上面是Factory的。下面是，或者请求的。
-    //	tx_mq: Option<Sender<(String, Vec<u8>)>>, //固定不变，但是必须有的。且是复制的。
-    tx_http: Option<HttpSender>, //这个不是固定的，是随机改变的。
-    tx_ws: Option<WsSender>, //这个也是随机改变的。
-}
-
-
-impl Default for Handler {
-    fn default() -> Handler {
-        Handler {
-            inner: Arc::new(Inner {
-                                responses: Mutex::new(HashMap::capacity(1000)),
-                                tx_responses: Mutex::new(HashMap::capacity(1000)),
-                            }),
-            tx_mq: None,
-            tx_http: None,
-            tx_ws: None,
+impl Senders {
+    pub fn send(self, data: String) {
+        match self {
+            Senders::HTTP(sender) => {
+                let mut res = Response::new();
+                //TODO
+                res.set_body(data);
+                sender.send(res);
+            }
+            Senders::WEBSOCKET(sender) => {
+                sender.send(data);
+            }
         }
     }
 }
 
-impl Handler {
-    pub fn set_tx_mq(&mut self, tx_mq: Sender<(String, Vec<u8>)>) {
-        self.tx_mq = Some(tx_mq);
+#[derive(Debug, Clone)]
+pub struct ReqInfo {
+    pub jsonrpc: Option<Version>,
+    pub id: Id,
+}
+
+unsafe impl Send for ReqInfo {}
+
+impl ReqInfo {
+    pub fn new(jsonrpc: Option<Version>, id: Id) -> ReqInfo {
+        ReqInfo { jsonrpc: jsonrpc, id: id }
+    }
+}
+
+#[derive(Clone)]
+pub struct RpcHandler {
+    responses: Arc<Mutex<HashMap<Vec<u8>, (ReqInfo, Senders)>>>,
+    tx_responses: Arc<Mutex<HashMap<Vec<u8>, (ReqInfo, Senders)>>>,
+
+    pub tx_mq: Option<Sender<(String, Vec<u8>)>>,
+    pub tx_pool: Option<Sender<Thunk<'static>>>,
+    //    pub tx_http: Cell<Option<HttpSender<Response>>>,
+    pub tx_ws: Option<WsSender>,
+}
+
+unsafe impl Send for RpcHandler {}
+
+unsafe impl Sync for RpcHandler {}
+
+impl Default for RpcHandler {
+    fn default() -> RpcHandler {
+        RpcHandler {
+            responses: Arc::new(Mutex::new(HashMap::with_capacity(1000 as usize))),
+            tx_responses: Arc::new(Mutex::new(HashMap::with_capacity(1000 as usize))),
+            tx_mq: None,
+            tx_ws: None,
+            tx_pool: None,
+        }
+    }
+}
+
+impl RpcHandler {
+    pub fn set_tx_pool(&mut self, tx_pool: Sender<Thunk<'static>>) {
+        self.tx_pool = Some(tx_pool);
     }
 
-    pub fn set_tx_http(&mut self, tx_http: HttpSender) {
-        self.tx_http = Some(tx_http);
+    pub fn set_tx_mq(&mut self, tx_mq: Sender<(String, Vec<u8>)>) {
+        self.tx_mq = Some(tx_mq);
     }
 
     pub fn set_tx_ws(&mut self, tx_ws: WsSender) {
@@ -146,29 +152,91 @@ impl Handler {
 }
 
 
-impl BaseHandler for Handler {}
+impl BaseHandler for RpcHandler {}
 
-
-
-#[derive(Clone)]
-pub enum TransferSender {
-    HTTP(HttpSender),
-    WS(WsSender),
+pub fn from_err(err: Error) -> String {
+    serde_json::to_string(&RpcFailure::from(err)).unwrap()
 }
 
-impl TransferSender {
-    pub fn send<T>(self, t: T) {
-        match self {
-            TransferSender::HTTP(sender) => {
-                //TODO 错误转换。
-                sender.send(t);
-            }
-            TransferSender::WS(sender) => {
-                //TODO 错误转换。
-                sender.send(t);
-            }
+impl RpcHandler {
+    pub fn deal_req(&self, data: String, sender: Senders) {
+        let req_id = Id::Null;
+        let jsonrpc_version: Option<Version> = None;
+        match RpcHandler::into_json(data) {
+            Err(err) => sender.send(from_err(err)),
+            Ok(rpc) => {
+                let req_id = rpc.id.clone();
+                let jsonrpc_version = rpc.jsonrpc.clone();
+                let topic = RpcHandler::select_topic(&rpc.method);
+                let req_info = ReqInfo {
+                    jsonrpc: jsonrpc_version.clone(),
+                    id: req_id.clone(),
+                };
+                let method_handler = MethodHandler;
+                match method_handler.from_req(rpc) {
+                    Err(err) => sender.send(from_err(err)),
+                    Ok(req_type) => {
+                        match req_type {
+                            method::RpcReqType::TX(tx_req) => {
+                                let hash = tx_req.crypt_hash().to_vec();
+                                let data: communication::Message = tx_req.into();
+                                let _ = self.tx_mq.as_ref().unwrap().send((topic, data.write_to_bytes().unwrap()));
+                                self.tx_responses.lock().insert(hash.to_vec(), (req_info, sender));
+                            }
 
+                            method::RpcReqType::REQ(_req) => {
+                                let key = _req.request_id.clone();
+                                let data: communication::Message = _req.into();
+                                let _ = self.tx_mq.as_ref().unwrap().send((topic, data.write_to_bytes().unwrap()));
+                                self.responses.lock().insert(key, (req_info, sender));
+                            }
+                        }
+                    }
+                };
+            }
         }
+    }
+
+
+    pub fn deal_res(&mut self, key: String, body: Vec<u8>) {
+        let (id, _, content_ext) = parse_msg(body.as_slice());
+        trace!("routint_key {:?},get msg cmid {:?}", key, display_cmd(id));
+        let this = self.clone();
+        //TODO match
+        if id == cmd_id(submodules::CHAIN, topics::RESPONSE) {
+            match content_ext {
+                MsgClass::RESPONSE(content) => {
+                    let req_id = content.request_id.clone();
+                    self.deal_respone(req_id, content.result.unwrap(), self.responses.clone());
+                }
+                _ => {}
+            }
+        } else if id == cmd_id(submodules::CONSENSUS, topics::TX_RESPONSE) {
+            match content_ext {
+                MsgClass::TXRESPONSE(content) => {
+                    let hash = content.hash.clone();
+                    self.deal_respone(hash, content, self.responses.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+
+    fn deal_respone<T: Into<ResponseBody> + Send + 'static>(&self, req_id: Vec<u8>, result: T, con: Arc<Mutex<HashMap<Vec<u8>, (ReqInfo, Senders)>>>) {
+        self.tx_pool.as_ref().unwrap().send(Box::new(move || {
+            let pair = con.lock().remove(&req_id);
+            drop(con);
+            if let Some(pair) = pair {
+                let rpc_success = RpcSuccess {
+                    jsonrpc: pair.0.jsonrpc.clone(),
+                    id: pair.0.id.clone(),
+                    result: result.into(),
+                };
+                let data = serde_json::to_string(&rpc_success).unwrap();
+                pair.1.send(data);
+            }
+        }));
     }
 }
 
@@ -176,7 +244,9 @@ impl TransferSender {
 #[cfg(test)]
 mod test {
     use super::BaseHandler;
+
     struct Handler {}
+
     impl BaseHandler for Handler {}
 
     #[test]
@@ -187,5 +257,4 @@ mod test {
         assert_eq!(Handler::select_topic(&"eth".to_string()), "jsonrpc.request".to_string());
         assert_eq!(Handler::select_topic(&"123".to_string()), "jsonrpc".to_string());
     }
-
 }

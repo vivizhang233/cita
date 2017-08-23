@@ -15,181 +15,122 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-#![allow(deprecated,unused_assignments, unused_must_use)]
-
-use base_hanlder::{BaseHandler, RpcResult};
-
-use base_hanlder::Handler;
-use futures::{BoxFuture, Future};
-use futures::future::FutureResult;
+use base_hanlder::*;
+use futures::Async;
+use futures::Future;
+use futures::Poll;
+use futures::Stream;
+//use futures::future::FutureResult;
 use futures::sync::oneshot;
-
+use futures::sync::oneshot::Receiver;
 use hyper;
-use hyper::Post;
-use hyper::header::ContentLength;
-use hyper::server::{Handler, Request, Response};
-use hyper::server::{Http, Service, NewService, Request, Response};
-use hyper::server::Server;
-use hyper::uri::RequestUri::AbsolutePath;
-
-
+use hyper::Method;
+//use hyper::header::ContentLength;
+use hyper::server::{Service, NewService, Request, Response};
 use jsonrpc_types::error::Error;
-use jsonrpc_types::method;
-use jsonrpc_types::response::{self as cita_response, RpcSuccess, RpcFailure};
-use libproto::{blockchain, request};
-use libproto::communication;
-use parking_lot::{RwLock, Mutex};
-use protobuf::Message;
-use serde_json;
-use std::cmp::Eq;
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::io::Read;
-use std::result;
-use std::sync::Arc;
-use std::sync::mpsc::Sender;
-use std::thread;
-use std::time::Duration;
-use util::H256;
+use std::boxed::Box;
+use std::io;
 
-impl NewService for Handler {
+
+impl NewService for RpcHandler {
     type Request = Request;
     type Response = Response;
     type Error = hyper::Error;
-    type Instance = HttpHandler;
-    fn new_service(&self) -> io::Result<Handler> {
+    type Instance = RpcHandler;
+    fn new_service(&self) -> io::Result<RpcHandler> {
         Ok(self.clone())
     }
 }
 
-impl Service for Handler {
-	type Request = Request;
-	type Response = Response;
-	type Error = hyper::Error;
-	type Future = BoxFuture<Response, hyper::Error>;
-	
-	fn call(&self, req: Request) -> Self::Future {
-		let (tx, rx) = oneshot::channel();
-		let this = self.clone();
-		// self.send_pool(||{
-		//	this.deal_http_req();
-		//
-		// });
-		rx.map_err(|_| {
-			//出错处理。以及错误转换。这个肯定是系统错误了。转化为hyper的系统错误。
-			
-			
-		})
-		  .boxed()
-		
-	}
+
+pub struct HanderReslut {
+    inner: Inner<Response, hyper::Error>,
+}
+
+impl HanderReslut {
+    pub fn new_err(err: hyper::Error) -> Self {
+        HanderReslut { inner: Inner::Error(Some(err)) }
+    }
+
+    pub fn new_ok(receiver: Receiver<Response>) -> Self {
+        HanderReslut { inner: Inner::Ok(receiver) }
+    }
+
+    pub fn new_not_ready() -> Self {
+        HanderReslut { inner: Inner::NotReady }
+    }
+}
+
+enum Inner<T, E> {
+    Error(Option<E>),
+    Ok(Receiver<T>),
+    NotReady,
 }
 
 
-impl Handler{
-    pub fn deal_req(&mut self, tx: TransferSender, data: String) -> Result<(), Error> {
-
-        let req_id = Id::Null;
-        let jsonrpc_version = None;
-        match HttpHandler::into_json(data) {
-            Err(err) => Err(err),
-            Ok(rpc) => {
-                let req_id = rpc.id.clone();
-                let jsonrpc_version = rpc.jsonrpc.clone();
-                let topic = WsHandler::select_topic(&rpc.method);
-                let req_info = ReqInfo {
-                    jsonrpc: jsonrpc_version.clone(),
-                    id: req_id.clone(),
-                };
-
-                _self.method_handler.from_req(rpc).map(|req_type| {
-                    match req_type {
-                        method::RpcReqType::TX(tx_req) => {
-                            //TODO key一定要唯一了。
-                            let hash = tx_req.crypt_hash();
-                            let data: communication::Message = tx_req.into();
-                            let _ = _self.tx.send((topic, data.write_to_bytes().unwrap()));
-
-                            _self.tx_responses.lock().insert(hash, (req_info, tx));
-                        }
-
-                        method::RpcReqType::REQ(_req) => {
-                            //TODO 请求id唯一可以用数字标识了。整数，usize 类型了，只要保证它是唯一的。这样的话包括容器也可以唯一了。
-                            let key = _req.request_id.clone();
-                            let data: communication::Message = _req.into();
-                            let _ = _self.tx.send((topic, data.write_to_bytes().unwrap()));
-                            _self.responses.lock().insert(key, (req_info, tx));
-                        }
-                    }
-                    ()
-                })
-            }
+impl Future for HanderReslut {
+    type Item = Response;
+    type Error = hyper::Error;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self.inner {
+            Inner::NotReady => Ok(Async::NotReady),
+            Inner::Error(ref mut err) => Err(err.take().unwrap()),
+            Inner::Ok(ref mut reciver) => Ok(reciver.poll().unwrap()),
         }
+    }
+}
+
+impl Service for RpcHandler {
+    type Request = Request;
+    type Response = Response;
+    type Error = hyper::Error;
+    type Future = HanderReslut;
+
+    fn call(&self, req: Request) -> Self::Future {
+        let path = req.path().to_owned();
+        let method = req.method().clone();
+        trace!("body {:?}", req.body_ref());
+
+        req.body().for_each(move |chunk| {
+                                trace!("-msg--{:?}", chunk);
+                                Ok(())
+                            });
+        return HanderReslut::new_not_ready();
 
     }
 }
 
-
-impl Handler {
-	
-    pub fn pase_url(&self, mut req: Request) -> Result<String, Error> {
-        let uri = req.uri.clone();
-        let method = req.method.clone();
-        match uri {
-            AbsolutePath(ref path) => {
-                match (&method, &path[..]) {
-                    (&Post, "/") => {
-                        let mut body = String::new();
-                        match req.read_to_string(&mut body) {
-                            Ok(_) => Ok(body),
-                            Err(_) => Err(Error::invalid_request()),//TODO
-                        }
-                    }
-                    _ => result::Result::Err(Error::invalid_request()),
-                }
-            }
-            _ => result::Result::Err(Error::invalid_request()),
-        }
-    }
-
-
-    pub fn deal_req(&self, post_data: String) -> Result<RpcSuccess, RpcFailure> {
-        match HttpHandler::into_json(post_data) {
-            Err(err) => Err(RpcFailure::from(err)),
-            Ok(rpc) => {
-                let req_id = rpc.id.clone();
-                let jsonrpc_version = rpc.jsonrpc.clone();
-                let topic = HttpHandler::select_topic(&rpc.method);
-                match self.method_handler.from_req(rpc)? {
-                    method::RpcReqType::TX(tx) => {
-                        let hash = tx.crypt_hash();
-                        self.send_mq(topic, tx.into(), self.tx_responses.clone(), hash)
-                            .map_err(|err_data| RpcFailure::from_options(req_id.clone(), jsonrpc_version.clone(), err_data))
-                            .map(|data| {
-                                     RpcSuccess {
-                                         jsonrpc: jsonrpc_version,
-                                         id: req_id,
-                                         result: cita_response::ResponseBody::from(data), //TODO
-                                     }
-                                 })
-                    }
-                    method::RpcReqType::REQ(req) => {
-                        let key = req.request_id.clone();
-                        self.send_mq(topic, req.into(), self.responses.clone(), key)
-                            .map_err(|err_data| RpcFailure::from_options(req_id.clone(), jsonrpc_version.clone(), err_data))
-                            .map(|data| {
-                                     RpcSuccess {
-                                         jsonrpc: jsonrpc_version,
-                                         id: req_id,
-                                         result: cita_response::ResponseBody::from(data.result.expect("chain response error")), //TODO
-                                     }
-                                 })
-                    }
-                }
-            }
-        }
-    }
-	
-	
-}
+//        match req.body().poll() {
+//            Ok(asy_data) => {
+//                match asy_data {
+//                    Async::Ready(op_data) => {
+//                        trace!("op_data {:?}", op_data);
+//                        let (tx, rx) = oneshot::channel();
+//                        let this = self.clone();
+//                        let sender = Senders::HTTP(tx);
+//                        self.tx_pool.as_ref().unwrap().send(Box::new(move || if let Some(data) = op_data {
+//                                                                         if path == "/".to_string() && method == Method::Post {
+//                                                                             let body = String::from_utf8(data.to_vec()).unwrap();
+//                                                                             trace!("Request data {:?}", body);
+//                                                                             this.deal_req(body, sender);
+//                                                                         } else {
+//                                                                             sender.send(from_err(Error::invalid_request()));
+//                                                                         }
+//                                                                     } else {
+//
+//                                                                         sender.send(from_err(Error::invalid_request()));
+//                                                                     }));
+//                        return HanderReslut::new_ok(rx);
+//                    }
+//                    Async::NotReady => {
+//                        trace!("op_data NotReady");
+//                        return HanderReslut::new_not_ready();
+//                    }
+//                }
+//            }
+//            Err(err) => {
+//                trace!("op_data err {:?}", err);
+//                return HanderReslut::new_err(err);
+//            }
+//        }
+//    }
