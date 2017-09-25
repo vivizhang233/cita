@@ -1,0 +1,15 @@
+[package]
+name = "jsonrpc_mock"
+version = "0.1.0"
+authors = ["suyanlong <592938410@qq.com>"]
+
+[dependencies]
+pubsub = { path = "../../share_libs/pubsub" }
+jsonrpc_types = { path = "../../jsonrpc/types" }
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"
+libproto = { path = "../../share_libs/proto"}
+protobuf = { version = "^1.0.0" }
+cita-crypto = { path = "../../share_libs/crypto" }
+log = "0.*"
