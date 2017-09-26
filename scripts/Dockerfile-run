@@ -1,0 +1,14 @@
+FROM ubuntu:16.04
+
+# docker run -ti -v $PWD:/data cryptape/cita /cita/admintool/admintool.sh
+# docker run -ti -v $PWD:/data cryptape/cita /cita/bin/chain -c /data/genesis.json
+ENV PATH $PATH:/cita/bin
+COPY admintool/release/bin/ /cita/bin/
+COPY admintool/ /cita/admintool/
+
+RUN apt-get update												\
+    && apt-get install -y libstdc++6 libsodium18 rabbitmq-server libssl-dev libgoogle-perftools4 python-pip	\
+    && pip install  -r /cita/admintool/requirements.txt			  				\
+    && rm -rf /var/lib/apt/lists /tmp/*
+
+WORKDIR /data
